@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>iris — supervise every Claude Code session</title>
+<meta name="description" content="A live terminal dashboard that supervises all your active Claude Code sessions — status, tokens, cost, AI summaries, and remote tool approvals." />
+<style>
+  :root {
+    --bg: #0d0d12;
+    --panel: #16161e;
+    --border: #2a2a38;
+    --fg: #e6e6ec;
+    --dim: #8a8a99;
+    --magenta: #c678dd;
+    --green: #69d36e;
+    --yellow: #e5c07b;
+    --red: #e06c75;
+    --cyan: #56b6c2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--magenta); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 20px; }
+
+  header { padding: 72px 0 40px; text-align: center; }
+  .badge {
+    display: inline-block; background: var(--magenta); color: #000;
+    font-weight: 700; padding: 2px 12px; border-radius: 4px; letter-spacing: 1px;
+  }
+  h1 { font-size: 2.6rem; margin: 22px 0 8px; letter-spacing: -1px; }
+  .tagline { color: var(--dim); font-size: 1.1rem; margin: 0 auto; max-width: 620px; }
+
+  section { padding: 28px 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 1.1rem; color: var(--magenta); text-transform: uppercase; letter-spacing: 2px; margin: 0 0 18px; }
+
+  pre {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px 18px; overflow-x: auto; font-size: 0.92rem; color: var(--fg);
+  }
+  code { color: var(--cyan); }
+  pre code { color: inherit; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 1rem; }
+  .card p { margin: 0; color: var(--dim); font-size: 0.92rem; }
+
+  /* mock dashboard */
+  .mock { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; font-size: 0.86rem; white-space: pre; overflow-x: auto; line-height: 1.5; }
+  .m { color: var(--magenta); } .g { color: var(--green); } .y { color: var(--yellow); }
+  .r { color: var(--red); } .c { color: var(--cyan); } .d { color: var(--dim); }
+
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  td.k { color: var(--green); white-space: nowrap; width: 1%; }
+  td.k b { background: #000; border: 1px solid var(--border); border-radius: 4px; padding: 1px 7px; color: var(--green); }
+  td.v { color: var(--dim); }
+
+  footer { padding: 40px 0 60px; text-align: center; color: var(--dim); font-size: 0.85rem; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <span class="badge">iris</span>
+    <h1>Watch every Claude session at once.</h1>
+    <p class="tagline">A fast terminal dashboard that supervises all your active Claude&nbsp;Code sessions — what each one is doing, its tokens and cost, an AI&nbsp;summary of where it's headed, and one-key tool approvals.</p>
+  </header>
+
+  <section>
+    <h2>The dashboard</h2>
+    <div class="mock"><span class="m"> iris </span> <span class="g">approved Bash</span>  4 active  <span class="r"> pending 1 </span>  · 3m · 14:21:07
+
+┌ sessions ───────────────┐ ┌ detail ────────────────────────────┐
+│ <span class="r">⚠</span> Build CLI to superv…   │ │ <span class="r">⚠ PENDING APPROVAL — Bash in iris</span>   │
+│   <span class="r">APPROVE Bash — a/d</span>      │ │ git push --force                    │
+│   iris · <span class="m">opus-4-8</span> · 7.2M  │ │ <span class="g">a</span> allow   <span class="r">d</span> deny                   │
+│ <span class="g">●</span> Slack triage           │ │ model opus-4-8  turns 31  ~cost <span class="g">$24</span>  │
+│   running · Bash         │ │ tool calls                          │
+│   slack · <span class="m">haiku-4-5</span>       │ │ Bash    <span class="y">████████░░</span> 18              │
+│ <span class="c">✓</span> Configure CloudSQL…    │ │ Edit    <span class="y">█████░░░░░</span> 9               │
+│   done · awaiting you    │ │ ── activity ──                      │
+│ <span class="d">○</span> Complete five actions  │ │ <span class="c">▸ you</span> add the gitignore           │
+│   idle · lanoria-club    │ │ <span class="y">⚒ Bash</span> cargo build --release      │
+└─────────────────────────┘ └─────────────────────────────────────┘
+ j/k move  a/d allow/deny  ⏎ details  s summary  i approvals  q quit</div>
+  </section>
+
+  <section>
+    <h2>What it does</h2>
+    <div class="grid">
+      <div class="card"><h3>Live activity</h3><p>Tails session transcripts and shows the latest prompt, thinking, tool call, and result as it happens.</p></div>
+      <div class="card"><h3>Status &amp; cost</h3><p>Per-session model, working/idle state, token breakdown, and an estimated USD cost.</p></div>
+      <div class="card"><h3>Tool timeline</h3><p>A histogram of which tools each session leans on — spot the one stuck in a build loop.</p></div>
+      <div class="card"><h3>AI summaries</h3><p>Press <code>s</code> for a Haiku-generated “doing / done / next” briefing of any session.</p></div>
+      <div class="card"><h3>Remote approvals</h3><p>A PreToolUse hook routes permission prompts to iris — approve or deny from one place, with an AI risk read.</p></div>
+      <div class="card"><h3>Never hangs</h3><p>A heartbeat means sessions fall back to their normal prompt the instant iris isn't running.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Install</h2>
+    <pre><code>git clone &lt;repo&gt; &amp;&amp; cd iris
+cargo install --path .   <span class="d"># drops `iris` in ~/.cargo/bin</span>
+
+iris                     <span class="d"># live dashboard</span>
+iris ls                  <span class="d"># one-shot table, no TUI</span></code></pre>
+    <p style="color:var(--dim);font-size:.9rem">Single static binary. Built with Rust + <a href="https://ratatui.rs">ratatui</a>. Reads the transcripts Claude Code writes under <code>~/.claude/projects/</code>.</p>
+  </section>
+
+  <section>
+    <h2>Keys</h2>
+    <table>
+      <tr><td class="k"><b>j</b> <b>k</b></td><td class="v">move between sessions</td></tr>
+      <tr><td class="k"><b>⏎</b></td><td class="v">open the approval detail (full input + AI risk read)</td></tr>
+      <tr><td class="k"><b>a</b> <b>d</b></td><td class="v">allow / deny the pending tool call</td></tr>
+      <tr><td class="k"><b>s</b></td><td class="v">AI summary of the selected session</td></tr>
+      <tr><td class="k"><b>i</b></td><td class="v">enable / disable approval interception</td></tr>
+      <tr><td class="k"><b>K</b></td><td class="v">set your Anthropic API key (saved 0600)</td></tr>
+      <tr><td class="k"><b>r</b></td><td class="v">force refresh</td></tr>
+      <tr><td class="k"><b>q</b></td><td class="v">quit</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    iris · a supervisor for Claude&nbsp;Code · cost figures are estimates
+  </footer>
+
+</div>
+</body>
+</html>

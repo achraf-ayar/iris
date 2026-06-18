@@ -1,0 +1,398 @@
+//! The approval bridge between a running Claude Code session and iris.
+//!
+//! iris cannot reach into a session's interactive permission prompt directly,
+//! so we use a supported `PreToolUse` hook. The hook IS this same binary
+//! (`iris hook`): on every tool call Claude Code pipes the request JSON to it,
+//! the hook writes a request file and blocks-polls for a decision file that the
+//! iris TUI writes when you press a key, then emits the `hookSpecificOutput`
+//! decision Claude Code expects.
+//!
+//! iris touches a heartbeat file while running; if it's stale (iris not up),
+//! the hook immediately defers to the normal interactive prompt rather than
+//! pausing the session.
+
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+
+/// Heartbeat older than this ⇒ treat iris as not running.
+const HEARTBEAT_STALE_SECS: u64 = 8;
+/// Max time the hook will wait for a decision before deferring to "ask".
+const POLL_TIMEOUT: Duration = Duration::from_secs(25);
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+pub fn base_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude")
+        .join("iris")
+}
+fn requests_dir() -> PathBuf {
+    base_dir().join("requests")
+}
+fn decisions_dir() -> PathBuf {
+    base_dir().join("decisions")
+}
+fn heartbeat_path() -> PathBuf {
+    base_dir().join("heartbeat")
+}
+
+fn ensure_dirs() {
+    let _ = std::fs::create_dir_all(requests_dir());
+    let _ = std::fs::create_dir_all(decisions_dir());
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append a diagnostic line to `~/.claude/iris/iris.log`. Cheap and best-effort.
+pub fn log(msg: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(base_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base_dir().join("iris.log"))
+    {
+        let _ = writeln!(f, "{} [{}] {}", now_secs(), std::process::id(), msg);
+    }
+}
+
+/// Heuristic check: is an `iris … hook` PreToolUse hook present in settings.json?
+/// Checks both the global and project settings files.
+pub fn hook_installed() -> bool {
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".claude").join("settings.json"));
+    }
+    paths.push(PathBuf::from(".claude").join("settings.json"));
+
+    for p in paths {
+        let v: Value = match std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let pre = v
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(Value::as_array);
+        if let Some(arr) = pre {
+            for entry in arr {
+                if let Some(hs) = entry.get("hooks").and_then(Value::as_array) {
+                    for h in hs {
+                        if let Some(cmd) = h.get("command").and_then(Value::as_str) {
+                            if cmd.contains("iris") && cmd.trim_end().ends_with("hook") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A tool call waiting for a human decision.
+pub struct Pending {
+    pub id: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub brief: String,
+    /// Full tool input, pretty-printed, for the detail view.
+    pub input: String,
+    pub cwd: String,
+    pub ts: u64,
+}
+
+// ---- iris (TUI) side -------------------------------------------------------
+
+/// Mark iris as alive so hooks know to route approvals here.
+pub fn touch_heartbeat() {
+    let _ = std::fs::create_dir_all(base_dir());
+    let _ = std::fs::write(heartbeat_path(), now_secs().to_string());
+}
+
+/// Load all pending approval requests from disk.
+pub fn load_pending() -> Vec<Pending> {
+    let mut out = Vec::new();
+    let rd = match std::fs::read_dir(requests_dir()) {
+        Ok(rd) => rd,
+        Err(_) => return out,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.extension().map_or(false, |x| x == "json") {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    let input = v
+                        .get("tool_input")
+                        .map(|ti| serde_json::to_string_pretty(ti).unwrap_or_default())
+                        .unwrap_or_default();
+                    out.push(Pending {
+                        id: v["id"].as_str().unwrap_or("").to_string(),
+                        session_id: v["session_id"].as_str().unwrap_or("").to_string(),
+                        tool_name: v["tool_name"].as_str().unwrap_or("tool").to_string(),
+                        brief: v["brief"].as_str().unwrap_or("").to_string(),
+                        input,
+                        cwd: v["cwd"].as_str().unwrap_or("").to_string(),
+                        ts: v["ts"].as_u64().unwrap_or(0),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write a decision for a pending request. The hook is polling for this file.
+pub fn write_decision(id: &str, allow: bool, reason: &str) {
+    ensure_dirs();
+    let decision = if allow { "allow" } else { "deny" };
+    log(&format!("iris: write_decision id={id} decision={decision}"));
+    let body = json!({ "decision": decision, "reason": reason }).to_string();
+    let _ = std::fs::write(decisions_dir().join(format!("{id}.json")), body);
+    // Drop the request immediately so the TUI stops showing it.
+    let _ = std::fs::remove_file(requests_dir().join(format!("{id}.json")));
+}
+
+// ---- hook side -------------------------------------------------------------
+
+fn iris_live() -> bool {
+    std::fs::metadata(heartbeat_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|age| age.as_secs() <= HEARTBEAT_STALE_SECS)
+        .unwrap_or(false)
+}
+
+/// Entry point for `iris hook`. Reads the PreToolUse payload on stdin and
+/// prints the decision JSON. Always exits 0 (a non-zero/garbage exit would
+/// block the tool); on any problem it defers to the normal prompt with "ask".
+pub fn run_hook() -> i32 {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+
+    let session_id = v["session_id"].as_str().unwrap_or("");
+    let tool_name = v["tool_name"].as_str().unwrap_or("tool");
+    let cwd = v["cwd"].as_str().unwrap_or("");
+    let brief = tool_brief(tool_name, v.get("tool_input"));
+
+    log(&format!(
+        "hook: tool={tool_name} session={session_id} iris_live={}",
+        iris_live()
+    ));
+
+    // iris not running → don't pause the session, fall back to the normal prompt.
+    if session_id.is_empty() || !iris_live() {
+        log("hook: iris not live → ask (deferring to normal prompt)");
+        emit("ask", "");
+        return 0;
+    }
+
+    ensure_dirs();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id = format!("{session_id}-{}-{}", nanos, std::process::id());
+    let req = json!({
+        "id": id,
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "brief": brief,
+        "tool_input": v.get("tool_input").cloned().unwrap_or(Value::Null),
+        "cwd": cwd,
+        "ts": now_secs(),
+    });
+    let req_path = requests_dir().join(format!("{id}.json"));
+    let dec_path = decisions_dir().join(format!("{id}.json"));
+    let _ = std::fs::write(&req_path, req.to_string());
+    log(&format!("hook: wrote request {id}, waiting for decision"));
+
+    let start = SystemTime::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&dec_path) {
+            let _ = std::fs::remove_file(&dec_path);
+            let _ = std::fs::remove_file(&req_path);
+            let dv: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let decision = dv["decision"].as_str().unwrap_or("ask");
+            let reason = dv["reason"].as_str().unwrap_or("");
+            emit(decision, reason);
+            return 0;
+        }
+        let elapsed = start.elapsed().unwrap_or(POLL_TIMEOUT);
+        if elapsed >= POLL_TIMEOUT || !iris_live() {
+            let _ = std::fs::remove_file(&req_path);
+            emit("ask", "iris: no decision in time, deferring to prompt");
+            return 0;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn settings_path(project: bool) -> Result<PathBuf, String> {
+    if project {
+        Ok(PathBuf::from(".claude").join("settings.json"))
+    } else {
+        Ok(dirs::home_dir()
+            .ok_or("cannot resolve home directory")?
+            .join(".claude")
+            .join("settings.json"))
+    }
+}
+
+fn is_iris_hook(cmd: &str) -> bool {
+    cmd.contains("iris") && cmd.trim_end().ends_with("hook")
+}
+
+/// Remove any `iris … hook` PreToolUse entry from settings.json (idempotent).
+pub fn uninstall_hook(project: bool) -> Result<String, String> {
+    let path = settings_path(project)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(format!("no settings file at {}", path.display())),
+    };
+    let mut root: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut removed = 0usize;
+    if let Some(arr) = root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("PreToolUse"))
+        .and_then(Value::as_array_mut)
+    {
+        for entry in arr.iter_mut() {
+            if let Some(hs) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = hs.len();
+                hs.retain(|h| {
+                    !h.get("command")
+                        .and_then(Value::as_str)
+                        .map(is_iris_hook)
+                        .unwrap_or(false)
+                });
+                removed += before - hs.len();
+            }
+        }
+        // Drop matcher entries left with no hooks.
+        arr.retain(|e| {
+            e.get("hooks")
+                .and_then(Value::as_array)
+                .map(|h| !h.is_empty())
+                .unwrap_or(true)
+        });
+    }
+    if removed == 0 {
+        return Ok(format!("no iris hook found in {}", path.display()));
+    }
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(format!("removed {removed} iris hook(s) from {}", path.display()))
+}
+
+/// Register `iris hook` as a PreToolUse hook in settings.json (idempotent).
+/// `project` targets `./.claude/settings.json` instead of the global one.
+pub fn install_hook(project: bool) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let command = format!("{} hook", exe.display());
+
+    let settings_path = settings_path(project)?;
+
+    let mut root: Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        return Err(format!("{} is not a JSON object", settings_path.display()));
+    }
+
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    let pre = hooks
+        .as_object_mut()
+        .ok_or("hooks is not an object")?
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    let arr = pre.as_array_mut().ok_or("hooks.PreToolUse is not an array")?;
+
+    // Already installed?
+    let installed = arr.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .map(|hs| {
+                hs.iter().any(|h| {
+                    h.get("command").and_then(Value::as_str) == Some(command.as_str())
+                })
+            })
+            .unwrap_or(false)
+    });
+    if installed {
+        return Ok(format!("already installed in {}", settings_path.display()));
+    }
+
+    arr.push(json!({
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": command, "timeout": 30 }],
+    }));
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&settings_path, out).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "installed PreToolUse hook in {}\ncommand: {command}\nRestart Claude Code sessions to pick it up.",
+        settings_path.display()
+    ))
+}
+
+fn emit(decision: &str, reason: &str) {
+    let v = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    });
+    println!("{v}");
+}
+
+/// One-line summary of a tool's input for display in the approval prompt.
+fn tool_brief(name: &str, input: Option<&Value>) -> String {
+    let input = match input {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let picked = match name {
+        "Bash" => s("command"),
+        "Read" | "Edit" | "Write" | "NotebookEdit" => s("file_path"),
+        "Grep" | "Glob" => s("pattern"),
+        "WebFetch" => s("url"),
+        "WebSearch" => s("query"),
+        _ => "",
+    };
+    let picked = if picked.is_empty() {
+        input
+            .as_object()
+            .and_then(|o| o.values().find_map(Value::as_str))
+            .unwrap_or("")
+    } else {
+        picked
+    };
+    let one = picked.split_whitespace().collect::<Vec<_>>().join(" ");
+    one.chars().take(120).collect()
+}
