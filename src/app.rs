@@ -149,6 +149,11 @@ pub struct App {
     /// The install/enable-approvals proposal modal is showing.
     pub install_open: bool,
     last_pending_logged: usize,
+
+    /// Approval gating armed: the hook intercepts other sessions and waits for
+    /// dashboard decisions. When disarmed, iris is a passive viewer and tool
+    /// calls flow through Claude Code's normal permission system with no delay.
+    pub gating: bool,
 }
 
 impl App {
@@ -189,9 +194,13 @@ impl App {
             hook_installed: bridge::hook_installed(),
             install_open: false,
             last_pending_logged: 0,
+            gating: false,
         };
         // Propose enabling approvals on first launch when the hook isn't set up.
         app.install_open = !app.hook_installed;
+        // Start disarmed so a stale flag from a crashed session never silently
+        // blocks other sessions; the user arms gating explicitly.
+        bridge::set_gating(false);
         bridge::touch_heartbeat();
         bridge::log(&format!(
             "iris start: api_key={} hook_installed={}",
@@ -242,6 +251,22 @@ impl App {
             Err(e) => self.flash = Some(format!("disable failed: {e}")),
         }
         self.install_open = false;
+    }
+
+    /// Arm/disarm approval gating. When armed, the hook intercepts other
+    /// sessions and waits for your a/d here; when disarmed, iris is passive.
+    pub fn toggle_gating(&mut self) {
+        if !self.hook_installed {
+            self.flash = Some("enable approvals first (the hook isn't installed)".into());
+            return;
+        }
+        self.gating = !self.gating;
+        bridge::set_gating(self.gating);
+        self.flash = Some(if self.gating {
+            "gating ARMED — iris now intercepts tool approvals".into()
+        } else {
+            "gating off — sessions run via normal permissions".into()
+        });
     }
 
     pub fn start_key_input(&mut self) {
@@ -450,6 +475,8 @@ RISK: low|medium|high",
     pub fn refresh(&mut self) {
         self.last_refresh = Instant::now();
         bridge::touch_heartbeat();
+        // Keep the on-disk gating flag in sync with our state each tick.
+        bridge::set_gating(self.gating);
         self.hook_installed = bridge::hook_installed();
 
         // Load pending hook approvals, keyed by session id (newest per session).
@@ -478,10 +505,8 @@ RISK: low|medium|high",
         // Annotate every reader with bridge state so status() is precise: a live
         // hook request is the authoritative "needs approval" signal.
         let pending_ids: HashSet<String> = self.pending.keys().cloned().collect();
-        let hook = self.hook_installed;
         for s in self.readers.values_mut() {
             s.live_request = pending_ids.contains(&s.id);
-            s.approvals_routed = hook;
         }
 
         let cutoff = SystemTime::now()

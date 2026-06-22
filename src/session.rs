@@ -14,11 +14,6 @@ use serde_json::Value;
 /// Keep the in-memory activity feed bounded; older events scroll off.
 const MAX_EVENTS: usize = 500;
 const TEXT_CLAMP: usize = 200;
-/// Without the hook, the transcript is our only signal: a tool_use that never
-/// got a result reads as "needs approval". But an abandoned session sits like
-/// that forever, so we stop pinning it past this quiet window and let it fall to
-/// idle.
-const STALE_PENDING_SECS: u64 = 600;
 
 #[derive(Default, Clone, Copy)]
 pub struct Usage {
@@ -114,13 +109,9 @@ pub struct Session {
     pub turn_done: bool,
 
     /// Set by the app each refresh from the hook bridge: a live approval request
-    /// exists for this session. This is the authoritative "waiting on a human"
-    /// signal — far more reliable than the transcript heuristic.
+    /// exists for this session. This is the authoritative, actionable "waiting on
+    /// a human" signal — far more reliable than the transcript heuristic.
     pub live_request: bool,
-    /// Set by the app each refresh: the `iris hook` is installed, so approvals
-    /// route through iris. When true, the absence of a `live_request` means the
-    /// tool is running / auto-approved / abandoned — NOT awaiting approval.
-    pub approvals_routed: bool,
 
     // tail bookkeeping
     offset: u64,
@@ -152,7 +143,6 @@ impl Session {
             pending_tool: None,
             turn_done: false,
             live_request: false,
-            approvals_routed: false,
             offset: 0,
             pending: String::new(),
         }
@@ -182,26 +172,17 @@ impl Session {
     /// permission prompts wait forever).
     pub fn status(&self) -> Status {
         let age = self.age_secs();
+        // A live hook request is the only reliable, *actionable* "needs
+        // approval" signal — and the only thing a/d in iris can act on. Driving
+        // the red state purely off it means an abandoned tool_use can never get
+        // stuck reading as NEEDS APPROVAL forever.
+        if self.live_request {
+            return Status::NeedsApproval;
+        }
         if self.pending_tool.is_some() {
-            // The hook bridge is authoritative when approvals route through iris.
-            if self.live_request {
-                return Status::NeedsApproval;
-            }
-            if self.approvals_routed {
-                // Hook installed but no live request: the call is running, was
-                // auto-approved, or the session was abandoned mid-tool. None of
-                // those is "needs approval" — don't pin it as such.
-                return if age <= 20 { Status::Working } else { Status::Idle };
-            }
-            // No hook — fall back to the transcript heuristic, but bound it so an
-            // abandoned tool_use stops reading as NEEDS APPROVAL forever.
-            return if age < 6 {
-                Status::Working
-            } else if age <= STALE_PENDING_SECS {
-                Status::NeedsApproval
-            } else {
-                Status::Idle
-            };
+            // Ended on a tool_use with no result yet: the tool is running, or the
+            // session was quietly abandoned mid-call. Neither needs you.
+            return if age <= 20 { Status::Working } else { Status::Idle };
         }
         if self.turn_done {
             return if age <= 8 { Status::Done } else { Status::Idle };

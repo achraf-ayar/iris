@@ -459,7 +459,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             "  ⚑ approvals off — press i to enable",
             Style::new().fg(Color::Yellow).bold(),
         ));
-    } else if !app.has_api_key() {
+    } else if app.gating {
+        spans.push(Span::styled(
+            "  ⚡ gating ARMED — A to disarm",
+            Style::new().fg(Color::Black).bg(Color::Yellow).bold(),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "  ⚐ passive — A to arm gating",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    if app.hook_installed && !app.has_api_key() {
         spans.push(Span::styled(
             "  · no API key — AI via claude CLI (K to set one)",
             Style::new().fg(Color::Yellow),
@@ -941,6 +952,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             chip(" ␣ "), txt(" fold  "),
             chip(" z "), txt(" fold all  "),
             chip(" a/d "), txt(" allow/deny  "),
+            chip(" A "), txt(" arm gating  "),
             chip(" s "), txt(" summary  "),
             chip(" i "), txt(" approvals  "),
             chip(" K "), txt(" key  "),

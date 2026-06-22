@@ -337,6 +337,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         KeyCode::Char(' ') => app.toggle_selected_group(),
                         KeyCode::Char('z') => app.toggle_all_groups(),
                         KeyCode::Char('i') => app.open_install(),
+                        KeyCode::Char('A') => app.toggle_gating(),
                         KeyCode::Char('K') => app.start_key_input(),
                         _ => {}
                     }
@@ -347,5 +348,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             break;
         }
     }
+    // Disarm on exit so no session keeps blocking once the dashboard is gone.
+    bridge::set_gating(false);
     Ok(())
 }

@@ -43,6 +43,27 @@ fn decisions_dir() -> PathBuf {
 fn heartbeat_path() -> PathBuf {
     base_dir().join("heartbeat")
 }
+/// Presence of this file ⇒ iris is "armed": the hook intercepts tool calls and
+/// waits for a dashboard decision. Absent ⇒ iris is passive and tool calls flow
+/// through Claude Code's normal permission system with no delay.
+fn gating_path() -> PathBuf {
+    base_dir().join("gating")
+}
+
+/// Is approval gating currently armed? Only meaningful while iris is live.
+pub fn gating_armed() -> bool {
+    gating_path().exists()
+}
+
+/// Arm or disarm approval gating (iris side).
+pub fn set_gating(armed: bool) {
+    if armed {
+        let _ = std::fs::create_dir_all(base_dir());
+        let _ = std::fs::write(gating_path(), b"1");
+    } else {
+        let _ = std::fs::remove_file(gating_path());
+    }
+}
 
 fn ensure_dirs() {
     let _ = std::fs::create_dir_all(requests_dir());
@@ -129,6 +150,7 @@ pub fn touch_heartbeat() {
 
 /// Load all pending approval requests from disk.
 pub fn load_pending() -> Vec<Pending> {
+    gc_stale_decisions();
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(requests_dir()) {
         Ok(rd) => rd,
@@ -137,37 +159,77 @@ pub fn load_pending() -> Vec<Pending> {
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().map_or(false, |x| x == "json") {
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                    let ts = v["ts"].as_u64().unwrap_or(0);
-                    // Drop dead/orphaned requests the hook can no longer act on.
-                    if ts != 0 && now_secs().saturating_sub(ts) > REQUEST_STALE_SECS {
-                        let _ = std::fs::remove_file(&p);
-                        log(&format!(
-                            "load_pending: GC stale request {} (age {}s)",
-                            p.display(),
-                            now_secs().saturating_sub(ts)
-                        ));
-                        continue;
-                    }
-                    let input = v
-                        .get("tool_input")
-                        .map(|ti| serde_json::to_string_pretty(ti).unwrap_or_default())
-                        .unwrap_or_default();
-                    out.push(Pending {
-                        id: v["id"].as_str().unwrap_or("").to_string(),
-                        session_id: v["session_id"].as_str().unwrap_or("").to_string(),
-                        tool_name: v["tool_name"].as_str().unwrap_or("tool").to_string(),
-                        brief: v["brief"].as_str().unwrap_or("").to_string(),
-                        input,
-                        cwd: v["cwd"].as_str().unwrap_or("").to_string(),
-                        ts,
-                    });
-                }
+            // A request the hook can no longer act on is litter — reap it. We use
+            // the request's own `ts`, falling back to the file mtime for
+            // empty/corrupt files (a hook killed before it finished writing).
+            let file_age = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let parsed = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+
+            let ts = parsed
+                .as_ref()
+                .and_then(|v| v["ts"].as_u64())
+                .unwrap_or(0);
+            let age = if ts != 0 {
+                now_secs().saturating_sub(ts)
+            } else {
+                file_age
+            };
+            if age > REQUEST_STALE_SECS {
+                let _ = std::fs::remove_file(&p);
+                log(&format!(
+                    "load_pending: GC stale request {} (age {age}s)",
+                    p.display()
+                ));
+                continue;
+            }
+
+            if let Some(v) = parsed {
+                let input = v
+                    .get("tool_input")
+                    .map(|ti| serde_json::to_string_pretty(ti).unwrap_or_default())
+                    .unwrap_or_default();
+                out.push(Pending {
+                    id: v["id"].as_str().unwrap_or("").to_string(),
+                    session_id: v["session_id"].as_str().unwrap_or("").to_string(),
+                    tool_name: v["tool_name"].as_str().unwrap_or("tool").to_string(),
+                    brief: v["brief"].as_str().unwrap_or("").to_string(),
+                    input,
+                    cwd: v["cwd"].as_str().unwrap_or("").to_string(),
+                    ts,
+                });
             }
         }
     }
     out
+}
+
+/// Reap decision files a dead/timed-out hook never consumed. The hook removes
+/// its own decision once read; anything left past the stale window is an orphan.
+fn gc_stale_decisions() {
+    let rd = match std::fs::read_dir(decisions_dir()) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let age = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if age > REQUEST_STALE_SECS {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// Write a decision for a pending request. The hook is polling for this file.
@@ -210,10 +272,19 @@ pub fn run_hook() -> i32 {
         iris_live()
     ));
 
-    // iris not running → don't pause the session, fall back to the normal prompt.
+    // iris not running → don't touch this tool call at all. Emitting "ask" here
+    // would force a confirmation prompt even for commands the user's settings
+    // auto-allow; emitting nothing lets Claude Code's normal permission flow run.
     if session_id.is_empty() || !iris_live() {
-        log("hook: iris not live → ask (deferring to normal prompt)");
-        emit("ask", "");
+        log("hook: iris not live → defer to normal permission flow");
+        return 0;
+    }
+
+    // iris is live but not armed → passive mode: never block or gate, just let
+    // the normal permission flow run. The user arms gating from the dashboard
+    // only when they want to supervise approvals.
+    if !gating_armed() {
+        log("hook: gating disarmed → defer to normal permission flow");
         return 0;
     }
 
@@ -243,15 +314,24 @@ pub fn run_hook() -> i32 {
             let _ = std::fs::remove_file(&dec_path);
             let _ = std::fs::remove_file(&req_path);
             let dv: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let decision = dv["decision"].as_str().unwrap_or("ask");
+            let decision = dv["decision"].as_str().unwrap_or("");
             let reason = dv["reason"].as_str().unwrap_or("");
-            emit(decision, reason);
+            // Only an explicit allow/deny overrides the normal flow. Anything
+            // else defers (emit nothing) so we don't force a spurious prompt.
+            if decision == "allow" || decision == "deny" {
+                emit(decision, reason);
+            } else {
+                log(&format!("hook: decision '{decision}' not allow/deny → defer"));
+            }
             return 0;
         }
         let elapsed = start.elapsed().unwrap_or(POLL_TIMEOUT);
         if elapsed >= POLL_TIMEOUT || !iris_live() {
+            // No decision from iris in time. Defer to the normal permission flow
+            // instead of forcing "ask" — that turned auto-allowed commands into
+            // manual prompts and flooded sessions with confirmations.
             let _ = std::fs::remove_file(&req_path);
-            emit("ask", "iris: no decision in time, deferring to prompt");
+            log("hook: no decision in time → defer to normal permission flow");
             return 0;
         }
         std::thread::sleep(POLL_INTERVAL);

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read the README
+    url: https://github.com/itzenata/iris#readme
+    about: See what iris is, the keys, the hard rules, and the current alpha status.
+  - name: View the landing page
+    url: https://itzenata.github.io/iris/
+    about: A live preview of the dashboard and what iris does.
