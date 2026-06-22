@@ -475,6 +475,15 @@ RISK: low|medium|high",
             let _ = s.refresh();
         }
 
+        // Annotate every reader with bridge state so status() is precise: a live
+        // hook request is the authoritative "needs approval" signal.
+        let pending_ids: HashSet<String> = self.pending.keys().cloned().collect();
+        let hook = self.hook_installed;
+        for s in self.readers.values_mut() {
+            s.live_request = pending_ids.contains(&s.id);
+            s.approvals_routed = hook;
+        }
+
         let cutoff = SystemTime::now()
             .checked_sub(self.window)
             .unwrap_or(SystemTime::UNIX_EPOCH);

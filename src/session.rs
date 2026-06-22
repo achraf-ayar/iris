@@ -14,6 +14,11 @@ use serde_json::Value;
 /// Keep the in-memory activity feed bounded; older events scroll off.
 const MAX_EVENTS: usize = 500;
 const TEXT_CLAMP: usize = 200;
+/// Without the hook, the transcript is our only signal: a tool_use that never
+/// got a result reads as "needs approval". But an abandoned session sits like
+/// that forever, so we stop pinning it past this quiet window and let it fall to
+/// idle.
+const STALE_PENDING_SECS: u64 = 600;
 
 #[derive(Default, Clone, Copy)]
 pub struct Usage {
@@ -108,6 +113,15 @@ pub struct Session {
     /// Last assistant turn ended naturally (`end_turn`/`stop_sequence`).
     pub turn_done: bool,
 
+    /// Set by the app each refresh from the hook bridge: a live approval request
+    /// exists for this session. This is the authoritative "waiting on a human"
+    /// signal — far more reliable than the transcript heuristic.
+    pub live_request: bool,
+    /// Set by the app each refresh: the `iris hook` is installed, so approvals
+    /// route through iris. When true, the absence of a `live_request` means the
+    /// tool is running / auto-approved / abandoned — NOT awaiting approval.
+    pub approvals_routed: bool,
+
     // tail bookkeeping
     offset: u64,
     pending: String,
@@ -137,6 +151,8 @@ impl Session {
             mtime: SystemTime::UNIX_EPOCH,
             pending_tool: None,
             turn_done: false,
+            live_request: false,
+            approvals_routed: false,
             offset: 0,
             pending: String::new(),
         }
@@ -167,10 +183,24 @@ impl Session {
     pub fn status(&self) -> Status {
         let age = self.age_secs();
         if self.pending_tool.is_some() {
-            return if age >= 6 {
+            // The hook bridge is authoritative when approvals route through iris.
+            if self.live_request {
+                return Status::NeedsApproval;
+            }
+            if self.approvals_routed {
+                // Hook installed but no live request: the call is running, was
+                // auto-approved, or the session was abandoned mid-tool. None of
+                // those is "needs approval" — don't pin it as such.
+                return if age <= 20 { Status::Working } else { Status::Idle };
+            }
+            // No hook — fall back to the transcript heuristic, but bound it so an
+            // abandoned tool_use stops reading as NEEDS APPROVAL forever.
+            return if age < 6 {
+                Status::Working
+            } else if age <= STALE_PENDING_SECS {
                 Status::NeedsApproval
             } else {
-                Status::Working
+                Status::Idle
             };
         }
         if self.turn_done {

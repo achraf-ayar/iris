@@ -22,6 +22,11 @@ const HEARTBEAT_STALE_SECS: u64 = 8;
 /// Max time the hook will wait for a decision before deferring to "ask".
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// A request older than this is dead: the hook has already hit POLL_TIMEOUT and
+/// deferred to the native prompt, or its process was killed and orphaned the
+/// file. Either way iris can no longer act on it, so we GC it rather than show a
+/// phantom "needs approval" forever. Kept a hair above POLL_TIMEOUT.
+const REQUEST_STALE_SECS: u64 = 30;
 
 pub fn base_dir() -> PathBuf {
     dirs::home_dir()
@@ -134,6 +139,17 @@ pub fn load_pending() -> Vec<Pending> {
         if p.extension().map_or(false, |x| x == "json") {
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    let ts = v["ts"].as_u64().unwrap_or(0);
+                    // Drop dead/orphaned requests the hook can no longer act on.
+                    if ts != 0 && now_secs().saturating_sub(ts) > REQUEST_STALE_SECS {
+                        let _ = std::fs::remove_file(&p);
+                        log(&format!(
+                            "load_pending: GC stale request {} (age {}s)",
+                            p.display(),
+                            now_secs().saturating_sub(ts)
+                        ));
+                        continue;
+                    }
                     let input = v
                         .get("tool_input")
                         .map(|ti| serde_json::to_string_pretty(ti).unwrap_or_default())
@@ -145,7 +161,7 @@ pub fn load_pending() -> Vec<Pending> {
                         brief: v["brief"].as_str().unwrap_or("").to_string(),
                         input,
                         cwd: v["cwd"].as_str().unwrap_or("").to_string(),
-                        ts: v["ts"].as_u64().unwrap_or(0),
+                        ts,
                     });
                 }
             }
