@@ -198,7 +198,8 @@ fn run_tui(mut app: App) -> Result<()> {
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
-    let poll = Duration::from_millis(150);
+    // A short poll keeps the live feed and key response feeling immediate.
+    let poll = Duration::from_millis(40);
     loop {
         app.tick();
         terminal.draw(|f| ui::draw(f, app))?;
@@ -255,16 +256,86 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         KeyCode::Char('q') => break,
                         _ => {}
                     }
-                } else {
+                } else if app.focused {
+                    // Scroll mode: vim motions drive the activity feed of the
+                    // entered session. Esc/h leaves; a/d/s still act on it.
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    let g_pending = app.take_pending_g();
                     match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                        KeyCode::Char('r') => app.refresh(),
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => app.exit_focus(),
+                        KeyCode::Char('d') if ctrl => app.feed_move(app.feed_half_page()),
+                        KeyCode::Char('u') if ctrl => app.feed_move(-app.feed_half_page()),
+                        KeyCode::Char('f') if ctrl => app.feed_move(app.feed_page()),
+                        KeyCode::Char('b') if ctrl => app.feed_move(-app.feed_page()),
+                        KeyCode::Char('j') | KeyCode::Down => app.feed_move(1),
+                        KeyCode::Char('k') | KeyCode::Up => app.feed_move(-1),
+                        KeyCode::PageDown => app.feed_move(app.feed_page()),
+                        KeyCode::PageUp => app.feed_move(-app.feed_page()),
+                        KeyCode::Char('g') => {
+                            if g_pending {
+                                app.feed_top()
+                            } else {
+                                app.pending_g = true
+                            }
+                        }
+                        KeyCode::Home => app.feed_top(),
+                        KeyCode::Char('G') | KeyCode::End => app.feed_bottom(),
                         KeyCode::Char('s') => app.open_summary(),
                         KeyCode::Char('a') => app.approve_selected(true),
                         KeyCode::Char('d') => app.approve_selected(false),
-                        KeyCode::Enter => app.open_approval(),
+                        KeyCode::Char('r') => app.refresh(),
+                        _ => {}
+                    }
+                } else {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    let g_pending = app.take_pending_g();
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('d') if ctrl => app.select_by(5),
+                        KeyCode::Char('u') if ctrl => app.select_by(-5),
+                        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                        KeyCode::Char('g') => {
+                            if g_pending {
+                                app.select_first()
+                            } else {
+                                app.pending_g = true
+                            }
+                        }
+                        KeyCode::Home => app.select_first(),
+                        KeyCode::Char('G') | KeyCode::End => app.select_last(),
+                        KeyCode::Char('r') => app.refresh(),
+                        KeyCode::Char('s') => app.open_summary(),
+                        // a/d act on a whole group when a header is selected,
+                        // else on the single selected session.
+                        KeyCode::Char('a') => {
+                            if app.selected_group().is_some() {
+                                app.approve_group(true)
+                            } else {
+                                app.approve_selected(true)
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if app.selected_group().is_some() {
+                                app.approve_group(false)
+                            } else {
+                                app.approve_selected(false)
+                            }
+                        }
+                        // Enter: fold a group header; open the approval modal if
+                        // the session has one waiting; otherwise enter scroll mode.
+                        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                            if app.selected_group().is_some() {
+                                app.toggle_selected_group()
+                            } else if app.selected_has_pending() && k.code == KeyCode::Enter {
+                                app.open_approval()
+                            } else {
+                                app.enter_focus()
+                            }
+                        }
+                        KeyCode::Char(' ') => app.toggle_selected_group(),
+                        KeyCode::Char('z') => app.toggle_all_groups(),
                         KeyCode::Char('i') => app.open_install(),
                         KeyCode::Char('K') => app.start_key_input(),
                         _ => {}

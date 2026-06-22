@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, SummaryState};
+use crate::app::{App, GroupInfo, Row, SummaryState};
 use crate::cost;
 use crate::session::{Event, EventKind, Session, Status};
 
@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_list(f, app, cols[0]);
     draw_detail(f, app, cols[1]);
-    draw_footer(f, root[2]);
+    draw_footer(f, app, root[2]);
 
     if app.popup_open {
         draw_summary_popup(f, app);
@@ -137,7 +137,7 @@ fn draw_install_popup(f: &mut Frame, app: &App) {
             vec![
                 Line::from(Span::styled(
                     "Let iris approve tool calls from your other Claude sessions?",
-                    Style::new().fg(Color::White).bold(),
+                    Style::new().fg(Color::Reset).bold(),
                 )),
                 Line::from(""),
                 Line::from(
@@ -199,7 +199,7 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
 
     let assess = match app.current_assessment() {
         Some(SummaryState::Done(t)) => {
-            Paragraph::new(t.clone()).style(Style::new().fg(Color::White))
+            Paragraph::new(t.clone()).style(Style::new().fg(Color::Reset))
         }
         Some(SummaryState::Loading) => {
             Paragraph::new("assessing risk…").style(Style::new().fg(Color::Yellow))
@@ -222,7 +222,7 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
         .border_style(Style::new().fg(Color::DarkGray));
     f.render_widget(
         Paragraph::new(p.input.clone())
-            .style(Style::new().fg(Color::Gray))
+            .style(Style::new().fg(Color::Reset))
             .block(input_block)
             .wrap(Wrap { trim: false }),
         rows[2],
@@ -261,7 +261,7 @@ fn draw_key_popup(f: &mut Frame, app: &App) {
         )),
         Line::from(Span::styled(
             format!("{masked}▏"),
-            Style::new().fg(Color::White),
+            Style::new().fg(Color::Reset),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -293,14 +293,16 @@ fn draw_summary_popup(f: &mut Frame, app: &App) {
         .split(inner);
 
     let body: Paragraph = match app.selected_summary() {
-        Some(SummaryState::Done(text)) => {
-            Paragraph::new(text.clone()).style(Style::new().fg(Color::White))
+        Some(SummaryState::Done(text)) => Paragraph::new(summary_lines(text)),
+        Some(SummaryState::Loading) => {
+            let via = if app.has_api_key() {
+                format!("{} API", short_model(Some(crate::anthropic::SUMMARY_MODEL)))
+            } else {
+                "claude CLI".to_string()
+            };
+            Paragraph::new(format!("generating summary via {via}…"))
+                .style(Style::new().fg(Color::Yellow))
         }
-        Some(SummaryState::Loading) => Paragraph::new(format!(
-            "generating summary with {}…",
-            short_model(Some(crate::anthropic::SUMMARY_MODEL))
-        ))
-        .style(Style::new().fg(Color::Yellow)),
         Some(SummaryState::Error(e)) => {
             Paragraph::new(format!("error: {e}")).style(Style::new().fg(Color::Red))
         }
@@ -315,6 +317,83 @@ fn draw_summary_popup(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::new().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(hint), rows[1]);
+}
+
+/// Render the model's `DOING / DONE / NEXT` briefing as styled lines. Each
+/// section gets an icon + colored heading echoing the status palette (green =
+/// in-progress, blue = done, yellow = where it's headed), with continuation
+/// lines bulleted and indented under their heading so multi-line DONE/NEXT
+/// blocks stay readable. Anything that doesn't match a section is shown plain.
+fn summary_lines(text: &str) -> Vec<Line<'static>> {
+    // icon, heading color, body style — keyed by the section label.
+    let section = |word: &str| -> Option<(&'static str, Color, Style)> {
+        match word {
+            "DOING" => Some(("●", Color::Green, Style::new().fg(Color::Reset).bold())),
+            "DONE" => Some(("✓", Color::Blue, Style::new().fg(Color::Reset))),
+            "NEXT" => Some((
+                "→",
+                Color::Yellow,
+                Style::new().fg(Color::Reset).add_modifier(Modifier::ITALIC),
+            )),
+            _ => None,
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Body style of the section we're currently under, for continuation lines.
+    let mut cur: Option<Style> = None;
+    let mut first = true;
+
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // A "LABEL:" prefix (or bare "LABEL") starts a new section heading.
+        let head = trimmed
+            .split_once(':')
+            .map(|(w, rest)| (w.trim(), rest.trim()))
+            .or(Some((trimmed, "")))
+            .and_then(|(w, rest)| section(&w.to_uppercase()).map(|s| (w, rest, s)));
+
+        if let Some((label, rest, (icon, hcolor, body_style))) = head {
+            // Blank spacer between sections (but not before the first).
+            if !first {
+                lines.push(Line::from(""));
+            }
+            first = false;
+            cur = Some(body_style);
+
+            let mut spans = vec![
+                Span::styled(format!("{icon} "), Style::new().fg(hcolor).bold()),
+                Span::styled(
+                    label.to_uppercase(),
+                    Style::new().fg(hcolor).bold().add_modifier(Modifier::UNDERLINED),
+                ),
+            ];
+            if !rest.is_empty() {
+                spans.push(Span::styled(format!("  {rest}"), body_style));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            // Continuation line — bullet + indent under the active heading.
+            let style = cur.unwrap_or_else(|| Style::new().fg(Color::Reset));
+            lines.push(Line::from(vec![
+                Span::styled("   • ", Style::new().fg(Color::DarkGray)),
+                Span::styled(trimmed.trim_start_matches(['-', '•', '*']).trim().to_string(), style),
+            ]));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            text.to_string(),
+            Style::new().fg(Color::Reset),
+        )));
+    }
+    lines
 }
 
 /// A rect centered in `area`, sized as a percentage of width/height.
@@ -355,10 +434,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    spans.push(Span::styled(
-        format!("  {count} active"),
-        Style::new().fg(Color::White).bold(),
-    ));
+    let ngroups = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r, crate::app::Row::Group(_)))
+        .count();
+    let active = if ngroups > 0 {
+        format!("  {count} active · {ngroups} groups")
+    } else {
+        format!("  {count} active")
+    };
+    spans.push(Span::styled(active, Style::new().fg(Color::Reset).bold()));
 
     // Pending approvals — red when there are any, so it's obvious a/d can act.
     let pend_style = if npending > 0 {
@@ -375,7 +461,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     } else if !app.has_api_key() {
         spans.push(Span::styled(
-            "  · no API key (press K)",
+            "  · no API key — AI via claude CLI (K to set one)",
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -393,7 +479,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .title(" sessions ")
         .border_style(Style::new().fg(Color::DarkGray));
 
-    if app.visible.is_empty() {
+    if app.rows.is_empty() {
         let p = Paragraph::new("no active sessions in window")
             .style(Style::new().fg(Color::DarkGray))
             .block(block);
@@ -402,38 +488,24 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let items: Vec<ListItem> = app
-        .sessions()
-        .map(|s| {
-            // A live hook approval overrides the transcript-derived status.
-            let (icon, color, state) = match app.pending.get(&s.id) {
-                Some(p) => ("⚠", Color::Red, format!("APPROVE {} — a/d", p.tool_name)),
-                None => status_glyph(s),
-            };
-            let header = Line::from(vec![
-                Span::styled(icon, Style::new().fg(color).bold()),
-                Span::raw(" "),
-                Span::styled(s.label(), Style::new().fg(Color::White)),
-            ]);
-            let meta = Line::from(vec![
-                Span::styled(format!("  {state}"), Style::new().fg(color).bold()),
-                Span::styled(format!(" · {}", s.project()), Style::new().fg(Color::Cyan)),
-                Span::styled(
-                    format!(" · {}", short_model(s.model.as_deref())),
-                    Style::new().fg(Color::Magenta),
-                ),
-                Span::styled(
-                    format!(" · {} tok", human_tokens(s.usage.total())),
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ]);
-            ListItem::new(vec![header, meta])
+        .rows
+        .iter()
+        .map(|row| match row {
+            Row::Group(g) => group_item(g),
+            Row::Session { path, grouped } => {
+                let s = match app.session_at(path) {
+                    Some(s) => s,
+                    None => return ListItem::new(""),
+                };
+                session_item(app, s, *grouped)
+            }
         })
         .collect();
 
+    // Reverse-video highlight adapts to any terminal theme (light or dark)
+    // instead of a fixed dark bar that vanishes on a light background.
     let list = List::new(items).block(block).highlight_style(
-        Style::new()
-            .bg(Color::Rgb(40, 40, 55))
-            .add_modifier(Modifier::BOLD),
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
     );
 
     let mut state = ListState::default();
@@ -441,16 +513,117 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// A one-line project header with a fold glyph and per-status counts.
+fn group_item(g: &GroupInfo) -> ListItem<'static> {
+    let glyph = if g.collapsed { "▸" } else { "▾" };
+    // Urgency tints the header so a folded group still signals it needs you.
+    let hcolor = if g.pending > 0 || g.needs > 0 {
+        Color::Red
+    } else if g.working > 0 {
+        Color::Green
+    } else if g.done > 0 {
+        Color::Blue
+    } else {
+        Color::DarkGray
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("{glyph} "), Style::new().fg(hcolor).bold()),
+        Span::styled(g.key.clone(), Style::new().fg(Color::Cyan).bold()),
+        Span::styled(format!(" ({})", g.count), Style::new().fg(Color::DarkGray)),
+        Span::raw("  "),
+    ];
+    let mut counts: Vec<Span> = Vec::new();
+    if g.pending > 0 {
+        counts.push(Span::styled(
+            format!("⚠{} ", g.pending),
+            Style::new().fg(Color::Red).bold(),
+        ));
+    } else if g.needs > 0 {
+        counts.push(Span::styled(
+            format!("⚠{} ", g.needs),
+            Style::new().fg(Color::Red).bold(),
+        ));
+    }
+    if g.working > 0 {
+        counts.push(Span::styled(format!("●{} ", g.working), Style::new().fg(Color::Green)));
+    }
+    if g.done > 0 {
+        counts.push(Span::styled(format!("✓{} ", g.done), Style::new().fg(Color::Blue)));
+    }
+    if g.idle > 0 {
+        counts.push(Span::styled(format!("○{}", g.idle), Style::new().fg(Color::DarkGray)));
+    }
+    spans.extend(counts);
+    if g.collapsed && !g.lead_label.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", g.lead_label),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// A compact single-line session row. Indented when it sits under a group.
+fn session_item(app: &App, s: &Session, grouped: bool) -> ListItem<'static> {
+    // A live hook approval overrides the transcript-derived status.
+    let (icon, color, state) = match app.pending.get(&s.id) {
+        Some(p) => ("⚠", Color::Red, format!("APPROVE {}", p.tool_name)),
+        None => status_glyph(s),
+    };
+    let indent = if grouped { "  " } else { "" };
+    let mut spans = vec![
+        Span::styled(format!("{indent}{icon} "), Style::new().fg(color).bold()),
+        Span::styled(clamp(&s.label(), 30), Style::new().fg(Color::Reset)),
+        Span::styled(format!("  {state}"), Style::new().fg(color).bold()),
+    ];
+    // For ungrouped (singleton) rows, show the project for context.
+    if !grouped {
+        spans.push(Span::styled(format!(" · {}", s.project()), Style::new().fg(Color::Cyan)));
+    }
+    spans.push(Span::styled(
+        format!(" · {}", short_model(s.model.as_deref())),
+        Style::new().fg(Color::Magenta),
+    ));
+    spans.push(Span::styled(
+        format!(" · {}", human_tokens(s.usage.total())),
+        Style::new().fg(Color::DarkGray),
+    ));
+    ListItem::new(Line::from(spans))
+}
+
+/// Clamp to `max` chars on one line, appending `…` when truncated.
+fn clamp(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max.saturating_sub(1)).chain(['…']).collect()
+    }
+}
+
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+    // A cyan border + title signals the pane is "entered" for scrolling.
+    let (title, border) = if app.focused {
+        (" detail · SCROLLING ", Color::Cyan)
+    } else {
+        (" detail ", Color::DarkGray)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" detail ")
-        .border_style(Style::new().fg(Color::DarkGray));
+        .title(title)
+        .border_style(Style::new().fg(border));
 
     let s = match app.selected_session() {
         Some(s) => s,
         None => {
-            f.render_widget(block, area);
+            // A group header is selected — show the group overview instead.
+            if let Some(g) = app.selected_group() {
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                draw_group_detail(f, app, g, inner);
+            } else {
+                f.render_widget(block, area);
+            }
             return;
         }
     };
@@ -481,7 +654,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
                 },
                 Style::new().fg(Color::Red).bold(),
             )),
-            Line::from(Span::styled(p.brief.clone(), Style::new().fg(Color::White))),
+            Line::from(Span::styled(p.brief.clone(), Style::new().fg(Color::Reset))),
             Line::from(vec![
                 Span::styled(" a ", Style::new().fg(Color::Black).bg(Color::Green).bold()),
                 Span::styled(" allow    ", Style::new().fg(Color::Green)),
@@ -502,7 +675,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let head = vec![
         Line::from(vec![
             Span::styled(format!("{icon} "), Style::new().fg(scolor).bold()),
-            Span::styled(s.label(), Style::new().fg(Color::White).bold()),
+            Span::styled(s.label(), Style::new().fg(Color::Reset).bold()),
             Span::styled(format!("   [{state}]"), Style::new().fg(scolor).bold()),
         ]),
         Line::from(vec![
@@ -523,7 +696,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("model ", Style::new().fg(Color::DarkGray)),
             Span::styled(short_model(s.model.as_deref()), Style::new().fg(Color::Magenta)),
             Span::styled("   turns ", Style::new().fg(Color::DarkGray)),
-            Span::styled(s.assistant_turns.to_string(), Style::new().fg(Color::White)),
+            Span::styled(s.assistant_turns.to_string(), Style::new().fg(Color::Reset)),
             Span::styled("   ~cost ", Style::new().fg(Color::DarkGray)),
             Span::styled(format!("${est:.2}"), Style::new().fg(Color::Green).bold()),
         ]),
@@ -543,7 +716,62 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(stats), rows[2]);
 
     draw_tools(f, s, rows[3]);
-    draw_feed(f, s, rows[4]);
+    draw_feed(f, app, s, rows[4]);
+}
+
+/// Detail pane for a selected (folded or open) project group: a header line
+/// with aggregate counts, then one compact line per session in the group.
+fn draw_group_detail(f: &mut Frame, app: &App, g: &GroupInfo, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let fold = if g.collapsed { "folded" } else { "open" };
+    let head = vec![
+        Line::from(vec![
+            Span::styled("group ", Style::new().fg(Color::DarkGray)),
+            Span::styled(g.key.clone(), Style::new().fg(Color::Cyan).bold()),
+            Span::styled(
+                format!("   {} sessions · {fold}", g.count),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("⚠ {} pending   ", g.pending), Style::new().fg(Color::Red).bold()),
+            Span::styled(format!("● {} working   ", g.working), Style::new().fg(Color::Green)),
+            Span::styled(format!("✓ {} done   ", g.done), Style::new().fg(Color::Blue)),
+            Span::styled(format!("○ {} idle", g.idle), Style::new().fg(Color::DarkGray)),
+        ]),
+        Line::from(Span::styled(
+            "⏎/␣ fold/unfold   a/d approve/deny all pending in group",
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+    f.render_widget(Paragraph::new(head), rows[0]);
+
+    let cap = rows[1].height as usize;
+    let lines: Vec<Line> = app
+        .group_sessions(&g.key)
+        .into_iter()
+        .take(cap)
+        .map(|s| {
+            let (icon, color, state) = match app.pending.get(&s.id) {
+                Some(p) => ("⚠", Color::Red, format!("APPROVE {}", p.tool_name)),
+                None => status_glyph(s),
+            };
+            Line::from(vec![
+                Span::styled(format!("{icon} "), Style::new().fg(color).bold()),
+                Span::styled(clamp(&s.label(), 34), Style::new().fg(Color::Reset)),
+                Span::styled(format!("  {state}"), Style::new().fg(color)),
+                Span::styled(
+                    format!("  · {}", human_tokens(s.usage.total())),
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), rows[1]);
 }
 
 /// One row for a "tools" heading plus up to a few tool bars.
@@ -574,32 +802,57 @@ fn draw_tools(f: &mut Frame, s: &Session, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(format!("{name:<14}"), Style::new().fg(Color::Yellow)),
             Span::styled(bar, Style::new().fg(Color::Yellow)),
-            Span::styled(format!(" {n}"), Style::new().fg(Color::White)),
+            Span::styled(format!(" {n}"), Style::new().fg(Color::Reset)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_feed(f: &mut Frame, s: &Session, area: Rect) {
+fn draw_feed(f: &mut Frame, app: &App, s: &Session, area: Rect) {
+    let total = s.events.len();
+    let inner_h = area.height.saturating_sub(1) as usize; // minus the TOP border
+
+    // Title doubles as a scroll read-out once the pane is entered.
+    let title = if app.focused {
+        let pos = if total == 0 { 0 } else { app.feed_cursor() + 1 };
+        format!(" activity  {pos}/{total}  ▲▼ j/k · ^d/^u · gg/G ")
+    } else if total > inner_h {
+        format!(" activity  (latest {inner_h}/{total} · ⏎ to scroll) ")
+    } else {
+        " activity ".to_string()
+    };
+    let border = if app.focused { Color::Cyan } else { Color::DarkGray };
     let block = Block::default()
         .borders(Borders::TOP)
-        .title(" activity ")
-        .border_style(Style::new().fg(Color::DarkGray));
+        .title(title)
+        .border_style(Style::new().fg(border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let cap = inner.height as usize;
-    if cap == 0 {
+    // Stash the real viewport height so half/full-page motions size correctly.
+    app.set_feed_viewport(inner.height);
+    if inner.height == 0 {
         return;
     }
-    let start = s.events.len().saturating_sub(cap);
-    let lines: Vec<Line> = s
-        .events
-        .iter()
-        .skip(start)
-        .map(event_line)
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+
+    let items: Vec<ListItem> = s.events.iter().map(|e| ListItem::new(event_line(e))).collect();
+    let mut list = List::new(items);
+    // A reverse-video current line gives the vim "cursor" feel while entered.
+    if app.focused {
+        list = list.highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    }
+
+    if app.focused {
+        // Persisted state: ratatui keeps the cursor visible and the offset
+        // smooth across frames.
+        let mut state = app.feed_state_mut();
+        f.render_stateful_widget(list, inner, &mut state);
+    } else {
+        // Not entered: just show the tail (park selection on the last line).
+        let mut state = ListState::default();
+        state.select(total.checked_sub(1));
+        f.render_stateful_widget(list, inner, &mut state);
+    }
 }
 
 fn event_line(e: &Event) -> Line<'static> {
@@ -607,45 +860,92 @@ fn event_line(e: &Event) -> Line<'static> {
         .ts
         .map(|t| t.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "--:--:--".into());
-    let (icon, color, label): (&str, Color, String) = match &e.kind {
-        EventKind::Prompt => ("▸", Color::Cyan, "you".into()),
-        EventKind::Assistant => ("✷", Color::White, "claude".into()),
-        EventKind::Thinking => ("·", Color::DarkGray, "think".into()),
-        EventKind::Tool(name) => ("⚒", Color::Yellow, name.clone()),
+    // Each action gets its own icon, accent color, and — crucially — its own
+    // text typography, so the feed reads at a glance: your prompts are bold,
+    // Claude's thinking is dim italic, tool commands are italic, results are
+    // muted (errors stay red), and Claude's replies are plain body text.
+    let (icon, color, label, text): (&str, Color, String, Style) = match &e.kind {
+        EventKind::Prompt => (
+            "▸",
+            Color::Cyan,
+            "you".into(),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        EventKind::Assistant => (
+            "✷",
+            Color::Green,
+            "claude".into(),
+            Style::new().fg(Color::Reset),
+        ),
+        EventKind::Thinking => (
+            "·",
+            Color::DarkGray,
+            "think".into(),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        EventKind::Tool(name) => (
+            "⚒",
+            Color::Yellow,
+            name.clone(),
+            Style::new()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+        ),
         EventKind::ToolResult { error } => {
             if *error {
-                ("✗", Color::Red, "result".into())
+                (
+                    "✗",
+                    Color::Red,
+                    "result".into(),
+                    Style::new().fg(Color::Red),
+                )
             } else {
-                ("←", Color::Green, "result".into())
+                (
+                    "←",
+                    Color::Green,
+                    "result".into(),
+                    Style::new().fg(Color::Reset).add_modifier(Modifier::DIM),
+                )
             }
         }
     };
     Line::from(vec![
         Span::styled(format!("{ts} "), Style::new().fg(Color::DarkGray)),
         Span::styled(format!("{icon} "), Style::new().fg(color)),
-        Span::styled(format!("{label} ", ), Style::new().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled(e.text.clone(), Style::new().fg(Color::Gray)),
+        Span::styled(format!("{label} "), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(e.text.clone(), text),
     ])
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(" j/k ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" move  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" a/d ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" allow/deny  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" ⏎ ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" approve details  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" s ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" summary  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" i ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" approvals  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" K ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" api key  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" r ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" refresh  ", Style::new().fg(Color::DarkGray)),
-        Span::styled(" q ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
-        Span::styled(" quit", Style::new().fg(Color::DarkGray)),
-    ]);
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let chip = |k: &'static str| Span::styled(k, Style::new().fg(Color::Black).bg(Color::DarkGray));
+    let txt = |t: &'static str| Span::styled(t, Style::new().fg(Color::DarkGray));
+
+    // In scroll mode the keys are repurposed for navigating the feed.
+    let line = if app.focused {
+        Line::from(vec![
+            chip(" j/k "), txt(" scroll  "),
+            chip(" g/G "), txt(" top/bottom  "),
+            chip(" PgUp/PgDn "), txt(" page  "),
+            chip(" s "), txt(" summary  "),
+            chip(" a/d "), txt(" allow/deny  "),
+            chip(" Esc/h "), txt(" back  "),
+            chip(" q "), txt(" quit"),
+        ])
+    } else {
+        Line::from(vec![
+            chip(" j/k "), txt(" move  "),
+            chip(" ⏎/l "), txt(" enter  "),
+            chip(" ␣ "), txt(" fold  "),
+            chip(" z "), txt(" fold all  "),
+            chip(" a/d "), txt(" allow/deny  "),
+            chip(" s "), txt(" summary  "),
+            chip(" i "), txt(" approvals  "),
+            chip(" K "), txt(" key  "),
+            chip(" q "), txt(" quit"),
+        ])
+    };
     f.render_widget(Paragraph::new(line), area);
 }

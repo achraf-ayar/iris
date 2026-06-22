@@ -6,6 +6,8 @@
 //! Used to generate short "what is this session doing / where is it headed"
 //! summaries with the cheapest fast model (Haiku).
 
+use std::process::{Command, Stdio};
+
 use serde_json::{json, Value};
 
 pub const SUMMARY_MODEL: &str = "claude-haiku-4-5";
@@ -36,6 +38,43 @@ pub fn summarize(api_key: &str, model: &str, digest: &str) -> Result<String, Str
 /// Risk-assess a pending tool call.
 pub fn assess(api_key: &str, model: &str, prompt: &str) -> Result<String, String> {
     message(api_key, model, ASSESS_PROMPT, prompt, 256)
+}
+
+/// Summarize via the local `claude` CLI — the no-API-key fallback. Uses the
+/// already-authenticated CLI so iris works out of the box without a key file.
+pub fn summarize_cli(model: &str, digest: &str) -> Result<String, String> {
+    cli_message(model, SYSTEM_PROMPT, digest)
+}
+
+/// Risk-assess via the local `claude` CLI.
+pub fn assess_cli(model: &str, prompt: &str) -> Result<String, String> {
+    cli_message(model, ASSESS_PROMPT, prompt)
+}
+
+/// Run `claude -p` headlessly with the system + user prompt folded into one
+/// query, and return its printed text. Errors (CLI missing, non-zero exit) are
+/// returned as readable strings.
+fn cli_message(model: &str, system: &str, user: &str) -> Result<String, String> {
+    let prompt = format!("{system}\n\n---\n\n{user}");
+    let out = Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--model")
+        .arg(model)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("claude CLI not available ({e}) — set a key with K"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg: String = err.trim().chars().take(160).collect();
+        return Err(format!("claude CLI failed: {msg}"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        Err("claude CLI returned no output".into())
+    } else {
+        Ok(text)
+    }
 }
 
 /// One-shot Messages API call. Errors are returned as human-readable strings.
